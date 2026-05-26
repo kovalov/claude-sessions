@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """claude-sessions: Browse and resume Claude Code sessions.
 
-Default action (Enter) — open selections as tabs in the current iTerm window.
-Ctrl-O                  — open as a new iTerm window with selections as tabs.
-Ctrl-V                  — open as split panes inside the current iTerm tab.
+Default action (Enter) — open selections as tabs / new tmux windows.
+Ctrl-O                  — open as a new iTerm window (same as Enter in tmux).
+Ctrl-V                  — open as split panes.
 
 Tab toggles multi-select. The picker shows recency, project name, and the
 first real user prompt from each session.
+
+Backends are auto-detected: tmux (if $TMUX is set), otherwise iTerm2 on macOS.
+Flags:
+  --projects-dir <path>          scan a different root (default: ~/.claude/projects)
+  --terminal {auto,iterm,tmux}   force a backend (default: auto)
 """
 
 import json
@@ -28,6 +33,40 @@ YELLOW = "\033[33m"
 BOLD = "\033[1m"
 RESET = "\033[0m"
 
+# Wrappers Claude Code injects around system content. A session's "first real
+# user prompt" should ignore these — they aren't messages the user typed.
+SYSTEM_TAG_PREFIXES = (
+    "<system-reminder>",
+    "<local-command-caveat>",
+    "<local-command-stdout>",
+    "<local-command-stderr>",
+    "<command-name>",
+    "<command-message>",
+    "<command-args>",
+    "<bash-input>",
+    "<bash-stdout>",
+    "<bash-stderr>",
+    "<user-prompt-submit-hook>",
+)
+
+
+def is_system_message(text: str) -> bool:
+    stripped = text.lstrip()
+    return any(stripped.startswith(tag) for tag in SYSTEM_TAG_PREFIXES)
+
+
+def extract_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [
+            b.get("text", "")
+            for b in content
+            if isinstance(b, dict) and b.get("type") == "text"
+        ]
+        return " ".join(p for p in parts if p).strip()
+    return ""
+
 
 def extract_metadata(jsonl_path: Path):
     """Return (cwd, first_real_user_message) by scanning a session jsonl."""
@@ -48,24 +87,9 @@ def extract_metadata(jsonl_path: Path):
 
                 if first_msg is None and obj.get("type") == "user":
                     msg = obj.get("message") or {}
-                    content = msg.get("content")
-                    text = None
-                    if isinstance(content, str):
-                        text = content
-                    elif isinstance(content, list):
-                        parts = [
-                            b.get("text", "")
-                            for b in content
-                            if isinstance(b, dict) and b.get("type") == "text"
-                        ]
-                        text = " ".join(p for p in parts if p).strip() or None
-                    if text:
-                        stripped = text.lstrip()
-                        # Skip auto-injected system reminders and local-command echoes
-                        if not stripped.startswith("<system-reminder>") \
-                           and not stripped.startswith("<local-command") \
-                           and not stripped.startswith("<command-name>"):
-                            first_msg = text
+                    text = extract_text(msg.get("content"))
+                    if text and not is_system_message(text):
+                        first_msg = text
 
                 if cwd is not None and first_msg is not None:
                     break
@@ -104,11 +128,11 @@ def relative_time(mtime: float, now: float) -> str:
     return time.strftime("%Y-%m-%d", time.localtime(mtime))
 
 
-def scan_sessions():
+def scan_sessions(projects_dir: Path):
     cache = load_cache()
     updated = {}
     sessions = []
-    for jsonl in PROJECTS_DIR.glob("*/*.jsonl"):
+    for jsonl in projects_dir.glob("*/*.jsonl"):
         try:
             mtime = jsonl.stat().st_mtime
         except OSError:
@@ -167,7 +191,7 @@ def preview(filepath: str):
         mtime = 0
     sess_id = p.stem
     cwd = ""
-    exchanges = []  # list of (role, text)
+    exchanges = []
     try:
         with open(p, "r", encoding="utf-8", errors="ignore") as f:
             for line in f:
@@ -181,21 +205,8 @@ def preview(filepath: str):
                 if t not in ("user", "assistant"):
                     continue
                 msg = obj.get("message") or {}
-                content = msg.get("content")
-                text = None
-                if isinstance(content, str):
-                    text = content
-                elif isinstance(content, list):
-                    parts = [
-                        b.get("text", "")
-                        for b in content
-                        if isinstance(b, dict) and b.get("type") == "text"
-                    ]
-                    text = " ".join(p for p in parts if p).strip() or None
-                if not text:
-                    continue
-                stripped = text.lstrip()
-                if stripped.startswith("<system-reminder>") or stripped.startswith("<local-command"):
+                text = extract_text(msg.get("content"))
+                if not text or is_system_message(text):
                     continue
                 exchanges.append((t, " ".join(text.split())))
     except OSError as e:
@@ -217,17 +228,30 @@ def preview(filepath: str):
 
 
 def applescript_str(s: str) -> str:
-    """Escape a string for safe insertion into an AppleScript double-quoted literal."""
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def shell_quote(s: str) -> str:
-    """POSIX-safe single-quote escaping."""
     return "'" + s.replace("'", "'\\''") + "'"
 
 
 def build_command(cwd: str, sess_id: str) -> str:
     return f"cd {shell_quote(cwd)} && claude --resume {sess_id}"
+
+
+def detect_backend(override=None):
+    """Return 'iterm', 'tmux', or None."""
+    if override and override != "auto":
+        if override not in ("iterm", "tmux"):
+            return None
+        return override
+    if os.environ.get("TMUX"):
+        return "tmux"
+    if sys.platform == "darwin":
+        for p in (Path("/Applications/iTerm.app"), Path.home() / "Applications" / "iTerm.app"):
+            if p.exists():
+                return "iterm"
+    return None
 
 
 def script_new_window(selections):
@@ -295,9 +319,7 @@ def script_panes(selections):
     return "\n".join(lines)
 
 
-def dispatch(selections, mode):
-    if not selections:
-        return
+def _dispatch_iterm(selections, mode):
     if mode == "new_window":
         script = script_new_window(selections)
     elif mode == "panes":
@@ -305,6 +327,68 @@ def dispatch(selections, mode):
     else:
         script = script_tabs(selections)
     subprocess.run(["osascript", "-e", script], check=False)
+
+
+def _dispatch_tmux(selections, mode):
+    if mode == "panes":
+        # Anchor every split to the current pane so siblings, not nested.
+        result = subprocess.run(
+            ["tmux", "display-message", "-p", "#{pane_id}"],
+            capture_output=True, text=True, check=False,
+        )
+        origin_pane = result.stdout.strip()
+        for i, (sess_id, cwd) in enumerate(selections):
+            cmd = build_command(cwd, sess_id)
+            direction = "-v" if (i % 2 == 0) else "-h"
+            args = ["tmux", "split-window", direction]
+            if origin_pane:
+                args += ["-t", origin_pane]
+            args += ["-c", cwd, cmd]
+            subprocess.run(args, check=False)
+    else:
+        # 'tabs' and 'new_window' both map to new tmux windows.
+        for sess_id, cwd in selections:
+            cmd = build_command(cwd, sess_id)
+            subprocess.run(["tmux", "new-window", "-c", cwd, cmd], check=False)
+
+
+def dispatch(selections, mode, backend):
+    if not selections:
+        return
+    if backend == "tmux":
+        _dispatch_tmux(selections, mode)
+    elif backend == "iterm":
+        _dispatch_iterm(selections, mode)
+    else:
+        print("No supported terminal backend.", file=sys.stderr)
+
+
+def parse_args(argv):
+    projects_dir = PROJECTS_DIR
+    terminal = None
+    args = list(argv)
+    while args:
+        a = args.pop(0)
+        if a in ("-h", "--help"):
+            print(__doc__)
+            sys.exit(0)
+        elif a == "--projects-dir":
+            if not args:
+                print("--projects-dir requires a value", file=sys.stderr)
+                sys.exit(2)
+            projects_dir = Path(args.pop(0)).expanduser()
+        elif a == "--terminal":
+            if not args:
+                print("--terminal requires a value (auto|iterm|tmux)", file=sys.stderr)
+                sys.exit(2)
+            terminal = args.pop(0)
+            if terminal not in ("auto", "iterm", "tmux"):
+                print(f"--terminal must be auto, iterm, or tmux (got: {terminal})", file=sys.stderr)
+                sys.exit(2)
+        else:
+            print(f"unknown argument: {a}", file=sys.stderr)
+            sys.exit(2)
+    return projects_dir, terminal
 
 
 def main():
@@ -330,14 +414,30 @@ def main():
         cwds = rest[sep + 1:]
         if not sess_ids or len(sess_ids) != len(cwds):
             return
-        dispatch(list(zip(sess_ids, cwds)), mode)
+        backend = detect_backend(os.environ.get("CLAUDE_SESSIONS_BACKEND"))
+        dispatch(list(zip(sess_ids, cwds)), mode, backend)
         return
 
-    if not PROJECTS_DIR.exists():
-        print(f"No projects dir at {PROJECTS_DIR}", file=sys.stderr)
+    projects_dir, terminal_override = parse_args(sys.argv[1:])
+
+    backend = detect_backend(terminal_override)
+    if backend is None:
+        print(
+            "No supported terminal backend detected.\n"
+            "Run inside tmux ($TMUX must be set), or use iTerm2 on macOS.\n"
+            "Override with --terminal {iterm,tmux}.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
-    sessions = scan_sessions()
+    # Propagate backend to the dispatch subprocess invoked by fzf.
+    os.environ["CLAUDE_SESSIONS_BACKEND"] = backend
+
+    if not projects_dir.exists():
+        print(f"No projects dir at {projects_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    sessions = scan_sessions(projects_dir)
     if not sessions:
         print("No Claude sessions found.", file=sys.stderr)
         sys.exit(1)
@@ -352,10 +452,16 @@ def main():
     preview_cmd = f"{py} {self_path} preview {{4}}"
     dispatch_prefix = f"{py} {self_path} dispatch"
 
-    footer = (
-        "  tab select   ·   enter tabs in current window   ·   "
-        "ctrl-o new window   ·   ctrl-v split panes   ·   esc close picker"
-    )
+    if backend == "tmux":
+        footer = (
+            "  tab select   ·   enter open windows   ·   "
+            "ctrl-o open windows   ·   ctrl-v split panes   ·   esc close picker"
+        )
+    else:
+        footer = (
+            "  tab select   ·   enter tabs in current window   ·   "
+            "ctrl-o new window   ·   ctrl-v split panes   ·   esc close picker"
+        )
 
     fzf_args = [
         "fzf",
