@@ -1,6 +1,8 @@
 # claude-sessions
 
-Browse and resume [Claude Code](https://docs.anthropic.com/en/docs/claude-code) sessions from a fuzzy picker. Pick one (or many) sessions, hit Enter, and they open as iTerm2 tabs already `cd`'d into the right project and resumed with `claude --resume`.
+Browse and resume [Claude Code](https://docs.anthropic.com/en/docs/claude-code) sessions from a fuzzy picker. Pick one (or many) sessions, hit Enter, and they open in new tabs / tmux windows / split panes already `cd`'d into the right project and resumed with `claude --resume`.
+
+![demo](docs/demo.gif)
 
 ```
 claude › ▎
@@ -14,11 +16,12 @@ The picker shows recency, project name, and the first real user prompt — so yo
 
 ## Requirements
 
-- macOS (uses `osascript` to drive iTerm)
-- [iTerm2](https://iterm2.com) — Terminal.app is not supported
 - Python 3.9+
-- [`fzf`](https://github.com/junegunn/fzf) on `PATH` — `brew install fzf`
-- Claude Code (obviously); reads its session logs from `~/.claude/projects/`
+- [`fzf`](https://github.com/junegunn/fzf) on `PATH` — `brew install fzf` / `apt install fzf`
+- Claude Code; reads its session logs from `~/.claude/projects/`
+- A supported terminal backend (either is fine):
+  - **tmux** — works on macOS and Linux. Run claude-sessions from inside a tmux session.
+  - **iTerm2** — macOS only. Used automatically when `$TMUX` is not set.
 
 ## Install
 
@@ -26,7 +29,7 @@ The picker shows recency, project name, and the first real user prompt — so yo
 curl -fsSL https://raw.githubusercontent.com/kovalov/claude-sessions/main/install.sh | bash
 ```
 
-Installs to `~/.local/bin/claude-sessions`. If that directory isn't on your PATH, the installer will tell you.
+Installs to `~/.local/bin/claude-sessions`. The installer warns if `fzf` or a supported terminal isn't available.
 
 Or grab the script directly:
 
@@ -38,31 +41,44 @@ curl -fsSL https://raw.githubusercontent.com/kovalov/claude-sessions/main/bin/cl
 ## Usage
 
 ```sh
-claude-sessions
+claude-sessions [--projects-dir <path>] [--terminal {auto,iterm,tmux}]
 ```
 
-| Key | Action |
-| --- | --- |
-| `Enter` | Open selection(s) as tabs in the current iTerm window |
-| `Ctrl-O` | Open as a new iTerm window with selection(s) as tabs |
-| `Ctrl-V` | Open as split panes inside the current iTerm tab |
-| `Tab` | Toggle multi-select |
-| `Esc` | Close picker |
+| Key | iTerm | tmux |
+| --- | --- | --- |
+| `Enter` | New tabs in current window | New tmux windows |
+| `Ctrl-O` | New iTerm window | Same as Enter (tmux has no separate window concept) |
+| `Ctrl-V` | Split panes in current tab | `tmux split-window` (alternating v/h) |
+| `Tab` | Toggle multi-select | Toggle multi-select |
+| `Esc` | Close picker | Close picker |
 
-Each opened tab runs `cd <project-cwd> && claude --resume <session-id>`.
+Each opened tab / window / pane runs `cd <project-cwd> && claude --resume <session-id>`.
+
+### Flags
+
+- `--projects-dir <path>` — scan a different directory instead of `~/.claude/projects/`. Useful for backup directories.
+- `--terminal {auto,iterm,tmux}` — force a backend. `auto` (default) picks tmux if `$TMUX` is set, otherwise iTerm2 if available.
 
 ## How it works
 
-1. Scans `~/.claude/projects/*/*.jsonl` (Claude Code's per-session transcripts).
-2. Extracts the project working directory and the first non-system user prompt from each session. Metadata is cached at `~/.cache/claude-sessions.json` keyed by file mtime, so repeated runs are instant.
+1. Scans `<projects-dir>/*/*.jsonl` (Claude Code's per-session transcripts).
+2. Extracts the project working directory and the first non-system user prompt from each session. Metadata is cached at `~/.cache/claude-sessions.json` keyed by file mtime, so repeated runs are instant. Deleted sessions are pruned from the cache on the next run.
 3. Pipes a colorized list into `fzf` with a live preview of recent turns.
-4. On a keybind, dispatches an AppleScript to iTerm to open new tabs / window / panes.
+4. On a keybind, dispatches to the active backend (iTerm via AppleScript or `tmux` CLI) to open windows / panes.
+
+## Demo recording
+
+`docs/demo.tape` is a [vhs](https://github.com/charmbracelet/vhs) script. To regenerate `docs/demo.gif`:
+
+```sh
+brew install vhs
+vhs docs/demo.tape
+```
 
 ## Limitations
 
-- macOS + iTerm2 only. PRs welcome for tmux / Linux terminals.
-- Sessions without a recorded `cwd` are hidden (rare, but happens with very short sessions).
-- The cache currently doesn't evict deleted sessions (it grows slowly; safe to `rm ~/.cache/claude-sessions.json` anytime).
+- Sessions without a recorded `cwd` are hidden (rare, happens with very short sessions).
+- In tmux, `Ctrl-O` is identical to `Enter` — tmux doesn't have a separate window-vs-tab concept to map onto.
 
 ## License
 
