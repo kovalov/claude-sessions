@@ -1,0 +1,387 @@
+#!/usr/bin/env python3
+"""claude-sessions: Browse and resume Claude Code sessions.
+
+Default action (Enter) — open selections as tabs in the current iTerm window.
+Ctrl-O                  — open as a new iTerm window with selections as tabs.
+Ctrl-V                  — open as split panes inside the current iTerm tab.
+
+Tab toggles multi-select. The picker shows recency, project name, and the
+first real user prompt from each session.
+"""
+
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+PROJECTS_DIR = HOME / ".claude" / "projects"
+CACHE_FILE = HOME / ".cache" / "claude-sessions.json"
+
+DIM = "\033[2m"
+GREEN = "\033[1;32m"
+CYAN = "\033[36m"
+GRAY = "\033[90m"
+YELLOW = "\033[33m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
+
+
+def extract_metadata(jsonl_path: Path):
+    """Return (cwd, first_real_user_message) by scanning a session jsonl."""
+    cwd = None
+    first_msg = None
+    try:
+        with open(jsonl_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line_no, line in enumerate(f):
+                if line_no > 500:
+                    break
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                if cwd is None and isinstance(obj.get("cwd"), str):
+                    cwd = obj["cwd"]
+
+                if first_msg is None and obj.get("type") == "user":
+                    msg = obj.get("message") or {}
+                    content = msg.get("content")
+                    text = None
+                    if isinstance(content, str):
+                        text = content
+                    elif isinstance(content, list):
+                        parts = [
+                            b.get("text", "")
+                            for b in content
+                            if isinstance(b, dict) and b.get("type") == "text"
+                        ]
+                        text = " ".join(p for p in parts if p).strip() or None
+                    if text:
+                        stripped = text.lstrip()
+                        # Skip auto-injected system reminders and local-command echoes
+                        if not stripped.startswith("<system-reminder>") \
+                           and not stripped.startswith("<local-command") \
+                           and not stripped.startswith("<command-name>"):
+                            first_msg = text
+
+                if cwd is not None and first_msg is not None:
+                    break
+    except OSError:
+        pass
+
+    if first_msg:
+        first_msg = " ".join(first_msg.split())[:240]
+    return cwd or "", first_msg or ""
+
+
+def load_cache():
+    if CACHE_FILE.exists():
+        try:
+            return json.loads(CACHE_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def save_cache(cache):
+    CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CACHE_FILE.write_text(json.dumps(cache))
+
+
+def relative_time(mtime: float, now: float) -> str:
+    age = now - mtime
+    if age < 60:
+        return "just now"
+    if age < 3600:
+        return f"{int(age / 60)}m ago"
+    if age < 86400:
+        return f"{int(age / 3600)}h ago"
+    if age < 7 * 86400:
+        return f"{int(age / 86400)}d ago"
+    return time.strftime("%Y-%m-%d", time.localtime(mtime))
+
+
+def scan_sessions():
+    cache = load_cache()
+    updated = {}
+    sessions = []
+    for jsonl in PROJECTS_DIR.glob("*/*.jsonl"):
+        try:
+            mtime = jsonl.stat().st_mtime
+        except OSError:
+            continue
+        key = str(jsonl)
+        entry = cache.get(key)
+        if entry and entry.get("mtime") == mtime:
+            cwd = entry.get("cwd", "")
+            first_msg = entry.get("first_msg", "")
+        else:
+            cwd, first_msg = extract_metadata(jsonl)
+        updated[key] = {"mtime": mtime, "cwd": cwd, "first_msg": first_msg}
+        sessions.append({
+            "mtime": mtime,
+            "sess_id": jsonl.stem,
+            "cwd": cwd,
+            "first_msg": first_msg,
+            "filepath": str(jsonl),
+        })
+    save_cache(updated)
+    sessions.sort(key=lambda s: s["mtime"], reverse=True)
+    return sessions
+
+
+def fzf_lines(sessions):
+    now = time.time()
+    rendered = []
+    for s in sessions:
+        if not s["cwd"]:
+            continue
+        rel = relative_time(s["mtime"], now)
+        proj = Path(s["cwd"]).name or s["cwd"]
+        msg = s["first_msg"] or "(no user prompts yet)"
+        if len(msg) > 90:
+            msg = msg[:87] + "…"
+        time_color = GREEN if (now - s["mtime"]) < 86400 else (YELLOW if (now - s["mtime"]) < 7 * 86400 else GRAY)
+        display = (
+            f"{time_color}{rel:>11}{RESET}  "
+            f"{BOLD}{proj:<34}{RESET}"
+            f"{CYAN}{msg}{RESET}"
+        )
+        rendered.append(f"{display}\t{s['sess_id']}\t{s['cwd']}\t{s['filepath']}")
+    return "\n".join(rendered)
+
+
+def preview(filepath: str):
+    """Pretty-print recent user/assistant exchanges from a session jsonl."""
+    p = Path(filepath)
+    if not p.exists():
+        print(f"file missing: {filepath}")
+        return
+
+    try:
+        mtime = p.stat().st_mtime
+    except OSError:
+        mtime = 0
+    sess_id = p.stem
+    cwd = ""
+    exchanges = []  # list of (role, text)
+    try:
+        with open(p, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not cwd and isinstance(obj.get("cwd"), str):
+                    cwd = obj["cwd"]
+                t = obj.get("type")
+                if t not in ("user", "assistant"):
+                    continue
+                msg = obj.get("message") or {}
+                content = msg.get("content")
+                text = None
+                if isinstance(content, str):
+                    text = content
+                elif isinstance(content, list):
+                    parts = [
+                        b.get("text", "")
+                        for b in content
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    ]
+                    text = " ".join(p for p in parts if p).strip() or None
+                if not text:
+                    continue
+                stripped = text.lstrip()
+                if stripped.startswith("<system-reminder>") or stripped.startswith("<local-command"):
+                    continue
+                exchanges.append((t, " ".join(text.split())))
+    except OSError as e:
+        print(f"read error: {e}")
+        return
+
+    print(f"{BOLD}Project:{RESET} {cwd}")
+    print(f"{BOLD}Session:{RESET} {sess_id}")
+    print(f"{BOLD}Modified:{RESET} {time.strftime('%Y-%m-%d %H:%M', time.localtime(mtime))}")
+    print(f"{BOLD}Turns:{RESET} {len(exchanges)}")
+    print()
+    print(f"{DIM}─── recent ───{RESET}")
+    for role, text in exchanges[-12:]:
+        label = f"{CYAN}you{RESET}" if role == "user" else f"{GREEN}claude{RESET}"
+        if len(text) > 360:
+            text = text[:357] + "…"
+        print(f"{label}: {text}")
+        print()
+
+
+def applescript_str(s: str) -> str:
+    """Escape a string for safe insertion into an AppleScript double-quoted literal."""
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def shell_quote(s: str) -> str:
+    """POSIX-safe single-quote escaping."""
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def build_command(cwd: str, sess_id: str) -> str:
+    return f"cd {shell_quote(cwd)} && claude --resume {sess_id}"
+
+
+def script_new_window(selections):
+    lines = ['tell application "iTerm"',
+             '  set newWin to (create window with default profile)']
+    for i, (sess_id, cwd) in enumerate(selections):
+        cmd = applescript_str(build_command(cwd, sess_id))
+        if i == 0:
+            lines += [
+                '  tell current session of newWin',
+                f'    write text "{cmd}"',
+                '  end tell',
+            ]
+        else:
+            lines += [
+                '  tell newWin',
+                '    create tab with default profile',
+                '    tell current session',
+                f'      write text "{cmd}"',
+                '    end tell',
+                '  end tell',
+            ]
+    lines.append('end tell')
+    return "\n".join(lines)
+
+
+def script_tabs(selections):
+    lines = ['tell application "iTerm"',
+             '  if (count of windows) is 0 then',
+             '    create window with default profile',
+             '  end if',
+             '  tell current window']
+    for sess_id, cwd in selections:
+        cmd = applescript_str(build_command(cwd, sess_id))
+        lines += [
+            '    create tab with default profile',
+            '    tell current session',
+            f'      write text "{cmd}"',
+            '    end tell',
+        ]
+    lines += ['  end tell', 'end tell']
+    return "\n".join(lines)
+
+
+def script_panes(selections):
+    # Anchor every split to the original picker pane so multi-select
+    # produces siblings, not nested splits.
+    lines = ['tell application "iTerm"',
+             '  if (count of windows) is 0 then',
+             '    create window with default profile',
+             '  end if',
+             '  set originSession to current session of current tab of current window']
+    for i, (sess_id, cwd) in enumerate(selections):
+        cmd = applescript_str(build_command(cwd, sess_id))
+        direction = "vertically" if (i % 2 == 0) else "horizontally"
+        lines += [
+            '  tell originSession',
+            f'    set newSession to (split {direction} with default profile)',
+            '    tell newSession',
+            f'      write text "{cmd}"',
+            '    end tell',
+            '  end tell',
+        ]
+    lines.append('end tell')
+    return "\n".join(lines)
+
+
+def dispatch(selections, mode):
+    if not selections:
+        return
+    if mode == "new_window":
+        script = script_new_window(selections)
+    elif mode == "panes":
+        script = script_panes(selections)
+    else:
+        script = script_tabs(selections)
+    subprocess.run(["osascript", "-e", script], check=False)
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "preview":
+        if len(sys.argv) < 3:
+            print("usage: claude-sessions preview <filepath>")
+            sys.exit(2)
+        preview(sys.argv[2])
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1] == "dispatch":
+        # Called by fzf's execute-silent. Args format:
+        #   dispatch <mode> <sess_id>... :: <cwd>...
+        if len(sys.argv) < 3:
+            sys.exit(2)
+        mode = sys.argv[2]
+        rest = sys.argv[3:]
+        try:
+            sep = rest.index("::")
+        except ValueError:
+            sys.exit(2)
+        sess_ids = rest[:sep]
+        cwds = rest[sep + 1:]
+        if not sess_ids or len(sess_ids) != len(cwds):
+            return
+        dispatch(list(zip(sess_ids, cwds)), mode)
+        return
+
+    if not PROJECTS_DIR.exists():
+        print(f"No projects dir at {PROJECTS_DIR}", file=sys.stderr)
+        sys.exit(1)
+
+    sessions = scan_sessions()
+    if not sessions:
+        print("No Claude sessions found.", file=sys.stderr)
+        sys.exit(1)
+
+    fzf_input = fzf_lines(sessions)
+    if not fzf_input:
+        print("No sessions with a known working directory.", file=sys.stderr)
+        sys.exit(1)
+
+    self_path = shell_quote(os.path.abspath(__file__))
+    py = shell_quote(sys.executable)
+    preview_cmd = f"{py} {self_path} preview {{4}}"
+    dispatch_prefix = f"{py} {self_path} dispatch"
+
+    footer = (
+        "  tab select   ·   enter tabs in current window   ·   "
+        "ctrl-o new window   ·   ctrl-v split panes   ·   esc close picker"
+    )
+
+    fzf_args = [
+        "fzf",
+        "--ansi",
+        "--multi",
+        "--delimiter", "\t",
+        "--with-nth", "1",
+        "--reverse",
+        "--height", "100%",
+        "--border", "rounded",
+        "--prompt", "claude › ",
+        "--preview", preview_cmd,
+        "--preview-window", "up,55%,wrap,border-bottom",
+        "--marker", "▎",
+        "--pointer", "›",
+        "--footer", footer,
+        "--footer-border", "horizontal",
+        "--color", "footer:bright-black",
+        # Each action dispatches and KEEPS the picker open.
+        "--bind", f"enter:execute-silent({dispatch_prefix} tabs {{+2}} :: {{+3}})+clear-selection",
+        "--bind", f"ctrl-o:execute-silent({dispatch_prefix} new_window {{+2}} :: {{+3}})+clear-selection",
+        "--bind", f"ctrl-v:execute-silent({dispatch_prefix} panes {{+2}} :: {{+3}})+clear-selection",
+    ]
+
+    subprocess.run(fzf_args, input=fzf_input, text=True)
+
+
+if __name__ == "__main__":
+    main()
