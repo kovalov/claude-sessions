@@ -1,0 +1,4 @@
+{"cwd": "/Users/demo/Code/homelab", "type": "user", "message": {"content": "debug why traefik isn't picking up the docker labels"}}
+{"type": "assistant", "message": {"content": "Most likely: the container isn't on the same docker network as Traefik. `docker network inspect proxy` and confirm the service is listed. Also check `traefik.enable=true` is on the container, not the service."}}
+{"type": "user", "message": {"content": "yeah it was the network — both moved to proxy and it works now"}}
+{"type": "assistant", "message": {"content": "Good. While you're in there, add `traefik.http.routers.<name>.entrypoints=websecure` so http traffic gets redirected automatically."}}

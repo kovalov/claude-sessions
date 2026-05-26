@@ -1,0 +1,4 @@
+{"cwd": "/Users/demo/Code/claude-sessions", "type": "user", "message": {"content": "add --json output flag to the picker"}}
+{"type": "assistant", "message": {"content": "Easiest: add a `--json` flag that, instead of launching fzf, prints the session list as JSON to stdout — one record per line with mtime, sess_id, cwd, first_msg. Pipe to jq from there."}}
+{"type": "user", "message": {"content": "yeah do that, but keep the picker as default"}}
+{"type": "assistant", "message": {"content": "Done. Default is unchanged. When `--json` is passed, scan_sessions runs and we json.dumps each entry, then exit."}}

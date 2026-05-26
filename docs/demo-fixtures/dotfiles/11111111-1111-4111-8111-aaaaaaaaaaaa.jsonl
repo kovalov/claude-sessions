@@ -1,0 +1,4 @@
+{"cwd": "/Users/demo/Code/dotfiles", "type": "user", "message": {"content": "fix the tmux prefix on linux"}}
+{"type": "assistant", "message": {"content": "Your ~/.tmux.conf has `set -g prefix C-a` AFTER the unbind, so the new prefix gets unbound. Swap the order, then `tmux source-file ~/.tmux.conf`."}}
+{"type": "user", "message": {"content": "worked, thanks"}}
+{"type": "assistant", "message": {"content": "If you want this portable across macOS and Linux, wrap the binding in an if-shell check on `uname`."}}

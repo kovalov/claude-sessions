@@ -1,0 +1,4 @@
+{"cwd": "/Users/demo/Code/personal-site", "type": "user", "message": {"content": "rewrite the about page in mdx"}}
+{"type": "assistant", "message": {"content": "I'll move src/pages/about.md to src/pages/about.mdx and import the Highlight component from src/components/Highlight.tsx so we can use it inline. Want a draft of the new structure first?"}}
+{"type": "user", "message": {"content": "yes show me the structure first"}}
+{"type": "assistant", "message": {"content": "Frontmatter with title and date, a brief intro paragraph, a <Highlight> callout, then three short sections: now / past / side projects. Keep the existing tone."}}

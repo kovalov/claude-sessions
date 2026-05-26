@@ -1,0 +1,4 @@
+{"cwd": "/Users/demo/Code/weekend-rust-cli", "type": "user", "message": {"content": "port the json parser to nom"}}
+{"type": "assistant", "message": {"content": "Plan: replace the handwritten tokenizer in src/parser/lex.rs with nom combinators. Start with `value` (which dispatches on the first char) and work down to literals. Want me to draft the lex.rs rewrite first?"}}
+{"type": "user", "message": {"content": "draft it"}}
+{"type": "assistant", "message": {"content": "Draft is in src/parser/lex.rs. Notable: switched to `alt((parse_object, parse_array, parse_string, parse_number, parse_bool, parse_null))`. Tests still pass."}}

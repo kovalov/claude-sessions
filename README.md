@@ -75,6 +75,8 @@ brew install vhs
 vhs docs/demo.tape
 ```
 
+The recording reads from `docs/demo-fixtures/` (synthetic session data committed to the repo), not your real `~/.claude/projects/`. `docs/setup-fixtures.sh` resets the fixture mtimes so the relative timestamps look natural; the tape runs it automatically.
+
 ## Limitations
 
 - Sessions without a recorded `cwd` are hidden (rare, happens with very short sessions).
